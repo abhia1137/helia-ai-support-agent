@@ -11,7 +11,8 @@
 - Agent code calls **registered tools**, never Helia APIs.
 - `customer_id`, `charge_id`, amounts, and account fields are **bound from `CaseContext`** (loaded for this ticket). Model output is not the source of those values.
 - Every mutation has an `idempotency_key`. Retrying a mutation without a new key is a bug.
-- Mutation preconditions (like "no refund exists on this charge") are re-checked **at execute time**, not only at planning — a human may act on same case from console in parallel.
+- Mutation preconditions (like "no refund exists on this charge") are re-checked **at execute time**, not only at planning. But a recheck is a staleness defense, not a concurrency one: irreversible mutations must **also be deduped by Helia** (e.g. refund idempotent on `charge_id`). That is a platform requirement — if it is missing, the action is not auto-eligible.
+- The tool **allowlist for a run is chosen by the orchestrator before the planner runs** (from category + risk classifier + secret filters). The model never selects its own tools.
 
 ---
 
@@ -42,7 +43,7 @@ Changing a row is a **policy version bump**, not a prompt edit. Finance owns the
 
 - **One** Helia capability per tool. No `doWhatever(json)`.
 - Register: side effect, max amount/fields, bind list, approval class, compensating action (or `irreversible`), PII class.
-- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path refunds the full last captured charge only, within Finance's refund window; partial or older charge goes to human.
+- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path fires only when there is **exactly one** refundable candidate charge, full amount, within Finance's refund window; partial, older, or ambiguous charge goes to human. Dedupe enforced Helia-side on `charge_id`.
 - **Reply send modes:** `draft` (human sends), `send_template(id)` (after a successful action; gateway fills placeholders), `send_kb_grounded` (question answer — **draft-first**, earns auto-send only after the claim-grounding eval bar; may only contain links/values from the returned KB articles), `send_freeform` (always human), and **acknowledgement templates** (allowed with no prior action because they make no claim). No `send_raw`.
 - **Lookup:** this ticket’s customer only. **KB lookup:** read-only, approved articles only.
 - **Plan / account:** payload is a diff against `CaseContext`.
@@ -64,7 +65,7 @@ This log is the Finance/Legal record of who approved **or denied** what. Retenti
 - [ ] Policy row + approval class
 - [ ] Contract tests
 - [ ] Golden evals: happy path, prompt injection, wrong customer, double refund, partial failure (action vs reply), and for any auto-send answer: hallucinated citation + claim-does-not-match-article
-- [ ] Inbound PII redaction runs before the prompt is built (not just before logging)
+- [ ] Inbound PII redaction runs before the prompt is built (class-scoped: strip secrets like PAN/CVV/SSN; keep update-account contact fields as structured values)
 - [ ] Shadow on historic tickets
 - [ ] Dashboard: success, overturn, dollars moved, cost/case
 - [ ] Kill switch `agent.tool.<name>`
