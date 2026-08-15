@@ -133,7 +133,7 @@ The prompt may say “ask a human.” That is documentation. **Enforcement is th
 | `change_plan` | No | Always human (billing impact) | Gateway + console |
 | `issue_refund` | Only if **all** predicates pass: **exactly one** refundable candidate charge, amount ≤ **$50**, amount equals that charge, charge captured, within Finance refund window, no prior refund, good standing, under velocity cap | Otherwise human. Approver is `human:<id>` or `policy:refund-v1` | Gateway + signed token (shape below) + Helia-side dedupe on `charge_id` |
 
-**Send modes** (this fixes the earlier hole where a KB answer had no legal way to reach the customer):
+**Send modes** — one class per risk level, so every path to the customer has a defined, enforceable door:
 
 - `draft` — never reaches customer, human sends.
 - `send_template(id)` — allowlisted template, allowed only after a successful action in this run. Placeholders filled by gateway.
@@ -206,7 +206,7 @@ Refunds have no rollback. The design therefore spends its complexity **before** 
 | 2 | 5% of tickets | Lookup + draft + escalate | Draft accept > 60%; p95 < 8s; cost < $0.03 |
 | 3 | 5% → 25% | Auto refund ≤ $50 under policy | Refunds stay at **100% human review** through this phase; auto-send of the refund confirmation only after N consecutive clean at 100%, then drop to a sample. Finance sign-off |
 | 4 | Wider | Plan/account via HITL cards | Approval wait acceptable; no billing incidents |
-| 5 | Per KB area | Auto-send `send_kb_grounded` answers (previously draft-only) | Claim-grounding eval passes a bar; human overturn on KB drafts below a threshold for N weeks; injected-link eval clean |
+| 5 | Per KB area | Auto-send `send_kb_grounded` answers (draft-only until this phase) | Claim-grounding eval passes a bar; human overturn on KB drafts below a threshold for N weeks; injected-link eval clean |
 
 **Kill switch:** `agent.enabled` and `agent.tool.<name>`. Turning refunds off leaves drafts up. On-call flips flags without a deploy.
 
