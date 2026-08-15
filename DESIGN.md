@@ -7,7 +7,7 @@ The job is not “an agent that calls APIs.” The job is a **control plane** bo
 Stated so they can be challenged on the call:
 
 - Tickets already have a trusted `customer_id`. The agent never discovers the customer from the email body.
-- Helia refunds a **specific captured charge** (`charge_id` + amount). If today’s API is “amount only,” the gateway still binds to the last captured charge and we treat a charge-id field as a platform gap.
+- Helia refunds a **specific captured charge** (`charge_id` + amount). If today’s API is “amount only,” the gateway still binds the amount from the single refundable candidate charge and we treat a charge-id field as a platform gap.
 - We can add an **approval card on the existing case** (not a new support product).
 - Currency USD. Auto-refund ceiling **$50** is a Finance-owned number; engineering enforces whatever they set.
 - Cost budget **$0.03 per auto-handled case**. No-HITL p95 **under 8 seconds**. HITL cases return a draft in that window and **wait asynchronously** — they do not block a request for a human.
@@ -72,7 +72,7 @@ Every path to the customer — auto-send or human send — goes through the gate
 | Part | Role |
 |------|------|
 | Orchestrator | Starts a run, enforces step/$/time budgets, writes the timeline onto the **same case**. Not an LLM. |
-| Context assembler | Calls `look_up_account` with the ticket’s `customer_id`. Builds typed `CaseContext` (plan, last captured charge, refundable amount, flags). This is the only source of money and identity for tools. |
+| Context assembler | Calls `look_up_account` with the ticket’s `customer_id`. Builds typed `CaseContext` (plan, refundable candidate charges, refundable amount, flags). This is the only source of money and identity for tools. |
 | Planner (model) | Sees the message, `CaseContext`, and the **allowlisted** tools for this intent. Emits `{intent, action, rationale}` — not an HTTP payload. |
 | Policy engine | Versioned rules: `ALLOW` / `REQUIRE_APPROVAL` / `DENY` / `ESCALATE`. Changing a threshold is a policy version, not a prompt edit. |
 | Tool gateway | The only **agent** path to Helia (holds the agent's credentials). Binds parameters, checks approval tokens, enforces idempotency, calls APIs. The human console keeps its own existing Helia access — see the audit note below. |
@@ -93,7 +93,7 @@ Observe → propose → bind → decide → act → observe. Hard stops, not vib
 
 - **Budgets:** max 6 model steps, $0.03, 25s wall clock on the auto path.
 - **Stop when:** action succeeded and a draft exists; `ESCALATE` / `DENY`; budget or timeout; the same bound tool call is requested twice.
-- **Retries:** GET-style tools once. Mutating tools never retry. `idempotency_key = case_id + tool + hash(bound payload)`.
+- **Retries:** GET-style tools once. Mutating tools never **blind-**retry (a clean failure re-attempts under §5 with a new key/token). `idempotency_key = case_id + tool + hash(bound payload)`.
 - **Unsure:** escalate. Do not loop the same step. “Unsure” includes schema-invalid output and intent that matches no tool.
 
 HITL is **async**. The run writes a card on the case and ends the hot path. When a human approves, a short resume run executes that one tool (token already bound) and drafts the reply. We do not hold a 60-minute model session.
@@ -101,7 +101,7 @@ HITL is **async**. The run writes a card on the case and ends the hot path. When
 **The model will be confidently wrong.** We do not try to read confidence. And the guiding rule for every check below: **a guard only the model can trigger is not a guard** — each is decided by a deterministic component (orchestrator, policy, gateway), never by the planner. We make it cheap for the model to be wrong:
 
 - Invalid JSON / wrong tool → drop, escalate; do not retry 10 times.
-- Amounts and IDs are bound: auto refund is always the **full last captured charge**. We do not parse money amount from ticket text, even if it is smaller — that text is untrusted, and one exception makes the rule weak. Partial refund always go to human.
+- Amounts and IDs are bound: auto refund is always the **full amount of the single refundable candidate charge** (next bullet). We do not parse money amount from ticket text, even if it is smaller — that text is untrusted, and one exception makes the rule weak. Partial refund always go to human.
 - Wrong-charge is caught **deterministically, not by model judgment**: the gateway pulls the set of refundable charges (in window, unrefunded) from Helia and auto-refunds only when that set is **exactly one**. A date/amount reference in the ticket must resolve to exactly one charge or it goes to a human with the candidates listed. If the real ask lives in an **attachment/screenshot** the agent can't parse, that is ambiguous too → escalate. "Refund my July payment" with two charges never auto-fires.
 - **The allowlist is chosen by the orchestrator before the planner runs** — from ticket category, a cheap risk classifier, and secret/keyword filters — so the model cannot hand itself a tool (a jailbroken planner must not be able to give itself the refund tool). Security / "password" / "take over this account" signals strip money tools from that run's allowlist.
 - Preconditions on refund: captured charge, within Finance refund window, no dispute, no prior refund on that charge, account in good standing, velocity cap (per account and fleet). **All** are rechecked **just before execute**, because a card may be approved hours later so dispute/standing/velocity go stale. But a recheck defends against **staleness, not concurrency** — read-then-execute is not atomic, so a parallel console refund can still land in the gap. The authoritative guard is therefore **Helia-side**: refunds must be idempotent/conditional on `charge_id` so Helia itself rejects a second refund. That is a hard **platform requirement**, not an assumption (same status as the charge-id field); if Helia truly cannot dedupe, refunds serialize through a single writer or stay human — the agent alone cannot make a bypassable console safe.
@@ -143,7 +143,7 @@ The prompt may say “ask a human.” That is documentation. **Enforcement is th
 
 Why auto anything: most volume is small and routine; a human on every $8 refund will not catch the queue up, and the brief says speed and cost matter. Why not auto plan changes or account edits: they are stateful, often need a conversation, and are reversible only with more billing risk.
 
-**Token:** minted only at the moment the human clicks approve — the card waiting in the console is not a token, so there is no expiry problem when approval comes hours later. After mint it is **signed by the gateway** (the gateway owns the signing key, in KMS; the console only relays the human decision, it never signs). It is single-use, 30-minute TTL, and bound to the exact action. The shape is generic across tools, not refund-only: `{case_id, customer_id, tool, params_hash, policy_version, approver}` — `params_hash` covers the refund charge/amount, or the plan-change diff, or the account-field diff. Editing anything in the console mints a new token. A token for customer A cannot act on customer B, and a refund token cannot be replayed for a plan change.
+**Token:** minted when the human clicks approve, never before — the card waiting in the console is not a token, so there is no expiry problem when approval comes hours later. Approval is given **once**; tokens are **per attempt** — after a clean execution failure the gateway re-mints under the same recorded approval (§5). After mint it is **signed by the gateway** (the gateway owns the signing key, in KMS; the console only relays the human decision, it never signs). It is single-use, 30-minute TTL, and bound to the exact action. The shape is generic across tools, not refund-only: `{case_id, customer_id, tool, params_hash, policy_version, approver}` — `params_hash` covers the refund charge/amount, or the plan-change diff, or the account-field diff. Editing anything in the console mints a new token. A token for customer A cannot act on customer B, and a refund token cannot be replayed for a plan change.
 
 **Who can approve also matters.** Not every support agent can approve every refund. Above a supervisor limit (say $500 — Finance owns the number) the approval card needs a senior role. Roles come from console permissions which already exist. To be precise about the trust chain: the gateway **trusts the console's authenticated assertion of who clicked** (the console owns login/SSO) and records that identity + role in the token and audit; it is not independently re-authenticating the human. So a junior click does not mint a valid token for a big amount, and the record shows exactly who approved.
 
@@ -168,7 +168,7 @@ The console remains the system of record. If the agent is down, support works as
 | What failed | What we do | Customer | Support |
 |-------------|------------|----------|---------|
 | Read / lookup | Retry once, then escalate | No false promise. SLA first-response can be a holding line from a template | Error on the case |
-| Mutation clearly fails | Agent re-cards the same bound action **inside the audited path** (re-mint under the same approval, bounded attempts); console retry is the manual last resort and, if used, is reconciled back into the record. Dedupe is enforced Helia-side on `charge_id` (platform requirement, §3), not by the recheck alone | No confirmation | Failed action, safe re-card |
+| Mutation clearly fails | Agent re-attempts the same bound action **inside the audited path** (gateway re-mints under the recorded approval — no new human click; bounded attempts); console retry is the manual last resort and, if used, is reconciled back into the record. Dedupe is enforced Helia-side on `charge_id` (platform requirement, §3), not by the recheck alone | No confirmation | Failed action, safe re-attempt |
 | Mutation times out (outcome unknown) | This is the real double-pay window. Do **not** blind-retry. First **reconcile**: read Helia back (by charge / idempotency key) to see if it went through, then decide. Unknown never means "try again" | No confirmation until reconciled | "Verifying" on the case |
 | Refund OK, reply fails | Do **not** refund again; queue template / human | Briefly unaware of a real refund — better than a lie | “Refund done, reply pending” |
 | Reply then failed action | Forbidden by ordering | — | — |

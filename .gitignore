@@ -4,3 +4,7 @@
 *.log
 .idea/
 .vscode/
+
+# Cursor local chat history / index — not part of the submission
+.specstory/
+.cursorindexingignore

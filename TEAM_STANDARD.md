@@ -29,8 +29,8 @@ Enforced in the **gateway**. A prompt that says “ask a human” is not enough.
 | Send an allowlisted template after a successful action in this run | No |
 | Update account | **Yes** |
 | Change plan | **Yes** |
-| Refund ≤ $50, full amount of last captured charge, all policy predicates pass | No — approver = `policy:<version>` |
-| Any other refund (partial amount, older charge, above ceiling) | **Yes** — approver = `human:<id>`, senior role above supervisor limit |
+| Refund ≤ $50, exactly **one** refundable candidate charge, full amount of that charge, all policy predicates pass | No — approver = `policy:<version>` |
+| Any other refund (partial amount, multiple or unresolved candidate charges, above ceiling) | **Yes** — approver = `human:<id>`, senior role above supervisor limit |
 | Answer a question covered by approved KB articles | Draft-first (human reviews); auto-send only after the eval bar (rollout Phase 5) |
 | Answer a question KB does not cover | Escalate — model memory is not a source |
 | Send a holding / acknowledgement template (no claim) | No |
@@ -43,7 +43,7 @@ Changing a row is a **policy version bump**, not a prompt edit. Finance owns the
 
 - **One** Helia capability per tool. No `doWhatever(json)`.
 - Register: side effect, max amount/fields, bind list, approval class, compensating action (or `irreversible`), PII class.
-- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path fires only when there is **exactly one** refundable candidate charge, full amount, within Finance's refund window; partial, older, or ambiguous charge goes to human. Dedupe enforced Helia-side on `charge_id`.
+- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path fires only when there is **exactly one** refundable candidate charge, full amount, within Finance's refund window; partial or ambiguous goes to human. Dedupe enforced Helia-side on `charge_id`.
 - **Reply send modes:** `draft` (human sends), `send_template(id)` (after a successful action; gateway fills placeholders), `send_kb_grounded` (question answer — **draft-first**, earns auto-send only after the claim-grounding eval bar; may only contain links/values from the returned KB articles), `send_freeform` (always human), and **acknowledgement templates** (allowed with no prior action because they make no claim). No `send_raw`.
 - **Lookup:** this ticket’s customer only. **KB lookup:** read-only, approved articles only.
 - **Plan / account:** payload is a diff against `CaseContext`.
