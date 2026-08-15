@@ -30,8 +30,9 @@ Enforced in the **gateway**. A prompt that says “ask a human” is not enough.
 | Change plan | **Yes** |
 | Refund ≤ $50, full amount of last captured charge, all policy predicates pass | No — approver = `policy:<version>` |
 | Any other refund (partial amount, older charge, above ceiling) | **Yes** — approver = `human:<id>`, senior role above supervisor limit |
-| Answer a question covered by approved KB articles | No |
+| Answer a question covered by approved KB articles | Draft-first (human reviews); auto-send only after the eval bar (rollout Phase 5) |
 | Answer a question KB does not cover | Escalate — model memory is not a source |
+| Send a holding / acknowledgement template (no claim) | No |
 
 Changing a row is a **policy version bump**, not a prompt edit. Finance owns the dollar figure.
 
@@ -42,7 +43,7 @@ Changing a row is a **policy version bump**, not a prompt edit. Finance owns the
 - **One** Helia capability per tool. No `doWhatever(json)`.
 - Register: side effect, max amount/fields, bind list, approval class, compensating action (or `irreversible`), PII class.
 - **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path refunds the full last captured charge only, within Finance's refund window; partial or older charge goes to human.
-- **Reply — four send modes only:** `draft` (human sends), `send_template(id)` (after a successful action; gateway fills placeholders), `send_kb_grounded` (question answer, auto-send only if every claim is cited to a returned KB article), `send_freeform` (always human). No `send_raw`.
+- **Reply send modes:** `draft` (human sends), `send_template(id)` (after a successful action; gateway fills placeholders), `send_kb_grounded` (question answer — **draft-first**, earns auto-send only after the claim-grounding eval bar; may only contain links/values from the returned KB articles), `send_freeform` (always human), and **acknowledgement templates** (allowed with no prior action because they make no claim). No `send_raw`.
 - **Lookup:** this ticket’s customer only. **KB lookup:** read-only, approved articles only.
 - **Plan / account:** payload is a diff against `CaseContext`.
 - **Approval token:** minted and signed by the **gateway** only (key in KMS; console just relays the human click). Single-use, 30-min TTL, generic shape `{case_id, customer_id, tool, params_hash, policy_version, approver}`. Kill-switch and all preconditions are re-checked at execute time, so a stale token will not fire.
@@ -62,7 +63,8 @@ This log is the Finance/Legal record of who approved **or denied** what. Retenti
 - [ ] Tool registered in the gateway (no private HTTP client)
 - [ ] Policy row + approval class
 - [ ] Contract tests
-- [ ] Golden evals: happy path, prompt injection, wrong customer, double refund, partial failure (action vs reply)
+- [ ] Golden evals: happy path, prompt injection, wrong customer, double refund, partial failure (action vs reply), and for any auto-send answer: hallucinated citation + claim-does-not-match-article
+- [ ] Inbound PII redaction runs before the prompt is built (not just before logging)
 - [ ] Shadow on historic tickets
 - [ ] Dashboard: success, overturn, dollars moved, cost/case
 - [ ] Kill switch `agent.tool.<name>`

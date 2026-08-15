@@ -50,6 +50,7 @@ flowchart TB
   Ticket --> Orch[Orchestrator]
   Orch --> Ctx[Context assembler]
   Ctx -->|look_up_account bound to ticket customer_id| Helia
+  Ctx -->|kb_lookup| KB[Approved help-center]
   Ctx --> Plan[LLM planner — structured proposal]
   Plan --> Pol[Policy engine]
   Pol -->|REQUIRE_APPROVAL| Console
@@ -59,9 +60,12 @@ flowchart TB
   GW -->|idempotent, bound params| Helia
   GW --> Audit[Immutable audit log]
   Orch --> Draft[Reply drafter]
-  Draft --> Console
-  Console -->|optional send| Helia
+  Draft -->|draft / freeform for human| Console
+  Draft -->|auto-send template / kb-grounded| GW
+  Console -->|human approve send| GW
 ```
+
+Every path to the customer — auto-send or human send — goes through the gateway (reply is itself a Helia tool), so nothing reaches a customer without hitting the same enforcement and audit point.
 
 **Main parts**
 
@@ -71,9 +75,9 @@ flowchart TB
 | Context assembler | Calls `look_up_account` with the ticket’s `customer_id`. Builds typed `CaseContext` (plan, last captured charge, refundable amount, flags). This is the only source of money and identity for tools. |
 | Planner (model) | Sees the message, `CaseContext`, and the **allowlisted** tools for this intent. Emits `{intent, action, rationale}` — not an HTTP payload. |
 | Policy engine | Versioned rules: `ALLOW` / `REQUIRE_APPROVAL` / `DENY` / `ESCALATE`. Changing a threshold is a policy version, not a prompt edit. |
-| Tool gateway | The only process with Helia credentials. Binds parameters, checks approval tokens, enforces idempotency, calls APIs. |
+| Tool gateway | The only **agent** path to Helia (holds the agent's credentials). Binds parameters, checks approval tokens, enforces idempotency, calls APIs. The human console keeps its own existing Helia access — see the audit note below. |
 | Support console | Unchanged as the human workspace. New: an approval/draft card on the case. Humans can still act with no agent. |
-| Audit log | Append-only. The Finance/Legal record. |
+| Audit log | Append-only. The Finance/Legal record for **agent** actions. Console-native human actions are recorded by the console's existing audit; the two are reconciled against Helia as source of truth, so "who did what" is always answerable even though it lives in two places on day one. Merging them is a fast-follow, not a launch blocker. |
 
 A customer request becomes an action like this: ticket → load `CaseContext` → model proposes → policy decides → (human signs if required) → gateway executes bound call → account re-read → draft reply on the case → send only if allowed.
 
@@ -102,7 +106,10 @@ HITL is **async**. The run writes a card on the case and ends the hot path. When
 - Preconditions on refund: captured charge, within Finance refund window, no dispute, no prior refund on that charge, account in good standing, velocity cap (per account and fleet). **All** of these are rechecked **just before execute**, not only at planning time — a human can act on the same case from the console in parallel (console today does not pass through our gateway), and a card may be approved hours later, so dispute status, standing, and velocity are all stale by then. The token's 30-minute TTL protects the token, not the world. We also assume Helia rejects a second refund on the same charge; if it does not, this execute-time recheck is the only guard, so it is mandatory.
 - Security / “password” / “take over this account” language → money tools are not even in the allowlist for that run.
 - After a mutation, re-read the account. If state ≠ expected, halt and escalate.
+- Execute-time rechecks cover **case** state too, not only Helia state: if the customer sent a newer message on the case after a card was raised ("actually, don't refund me"), the card is invalidated and sent back for re-review. Otherwise a human could approve, hours later, an action the customer already retracted, and every Helia predicate would still pass.
 - Auto-refunds: 100% daily review in week 1, then 10% sample.
+
+**`update_account` is the one place values come from the customer, not `CaseContext`.** A new email or address cannot pre-exist in Helia — its only source is the ticket text via the model. We call this exception out on purpose (an unstated exception is what makes the rule weak): the proposed new values are shown verbatim on the human card as a before/after diff, the human is approving the **values**, not just the action, the gateway format-validates them, and sensitive changes (email, payout details) require out-of-band re-verification, never the agent's word.
 
 **Questions with no action.** Big part of the ticket volume is just questions ("does Pro plan have SSO?"). For these the model answers only from approved help-center articles we pass in context (a read-only KB lookup tool). Model own memory is not a source — it will sound correct and be wrong, and that answer goes to a real customer. If KB does not cover it, escalate.
 
@@ -121,23 +128,24 @@ The prompt may say “ask a human.” That is documentation. **Enforcement is th
 | `look_up_account` | Yes | Only this ticket’s `customer_id` | Gateway bind |
 | `kb_lookup` | Yes | Read-only. Returns approved help-center articles for grounding an answer | Gateway (read-only) |
 | `escalate_to_human` | Yes | Always allowed | Gateway |
-| `reply_to_customer` | Draft yes | Four send modes (below). `send_freeform` always needs a human | Gateway: `draft` / `send_template` / `send_kb_grounded` / `send_freeform` |
-| `update_account` | No | Always human. Payload is a diff against `CaseContext`, not free text | Gateway + console |
+| `reply_to_customer` | Draft yes | Send modes below. `send_freeform` always needs a human | Gateway: `draft` / `send_template` / `send_kb_grounded` / `send_freeform` / ack-template |
+| `update_account` | No | Always human. New values come from the customer message and are approved as a before/after diff on the card (see §3) | Gateway + console |
 | `change_plan` | No | Always human (billing impact) | Gateway + console |
 | `issue_refund` | Only if **all** predicates pass: amount ≤ **$50**, amount equals bound charge, charge captured, within Finance refund window, no prior refund, good standing, under velocity cap | Otherwise human. Approver is `human:<id>` or `policy:refund-v1` | Gateway + signed token (shape below) |
 
-**Four send modes** (this fixes the earlier hole where a KB answer had no legal way to reach the customer):
+**Send modes** (this fixes the earlier hole where a KB answer had no legal way to reach the customer):
 
 - `draft` — never reaches customer, human sends.
 - `send_template(id)` — allowlisted template, allowed only after a successful action in this run. Placeholders filled by gateway.
-- `send_kb_grounded` — an answer for a plain question, auto-send allowed **only if every claim is cited to an article that `kb_lookup` actually returned**. Anything not covered by KB → drops to `draft` / escalate. This keeps "no autonomous freeform" true while still letting the biggest volume (questions) auto-resolve.
+- `send_kb_grounded` — an answer for a plain question. **Honest limit:** the gateway can check that a cited article ID was really returned by `kb_lookup`, but it cannot deterministically check that the sentence matches the article — unlike a refund predicate, this guard is not fully checkable. So this mode is **draft-first**: a human reviews it, and it only earns auto-send later, per team and per KB area, after it clears an eval bar (see rollout Phase 5) and with an overturn metric watching it. Extra hard rules the gateway *can* enforce: the answer may only contain links/values that appear in the returned articles (kills the injected-phishing-link exit), any sentence without a citation → drop to `draft`, anything not covered by KB → escalate. This is the one autonomous-to-customer path, so it is gated the hardest, not the least.
 - `send_freeform` — free text, always a human.
+- **Holding / acknowledgement templates** are a separate allowlisted class that may send **without** a prior successful action, because they make no claim and promise nothing ("we got your request, working on it"). This is what the failure table's holding replies use — otherwise the "template only after an action" rule would 403 the very reply the failure plan needs.
 
 Why auto anything: most volume is small and routine; a human on every $8 refund will not catch the queue up, and the brief says speed and cost matter. Why not auto plan changes or account edits: they are stateful, often need a conversation, and are reversible only with more billing risk.
 
 **Token:** minted only at the moment the human clicks approve — the card waiting in the console is not a token, so there is no expiry problem when approval comes hours later. After mint it is **signed by the gateway** (the gateway owns the signing key, in KMS; the console only relays the human decision, it never signs). It is single-use, 30-minute TTL, and bound to the exact action. The shape is generic across tools, not refund-only: `{case_id, customer_id, tool, params_hash, policy_version, approver}` — `params_hash` covers the refund charge/amount, or the plan-change diff, or the account-field diff. Editing anything in the console mints a new token. A token for customer A cannot act on customer B, and a refund token cannot be replayed for a plan change.
 
-**Who can approve also matters.** Not every support agent can approve every refund. Above a supervisor limit (say $500 — Finance owns the number) the approval card needs a senior role. Roles come from console permissions which already exist; gateway checks the role inside the token, so a junior click simply does not produce a valid token for big amount.
+**Who can approve also matters.** Not every support agent can approve every refund. Above a supervisor limit (say $500 — Finance owns the number) the approval card needs a senior role. Roles come from console permissions which already exist. To be precise about the trust chain: the gateway **trusts the console's authenticated assertion of who clicked** (the console owns login/SSO) and records that identity + role in the token and audit; it is not independently re-authenticating the human. So a junior click does not mint a valid token for a big amount, and the record shows exactly who approved.
 
 **Template blanks are not model's job.** Auto-send templates have placeholders like {amount} and {date}. Gateway fills them from **bound values**, never from model text. Otherwise refund succeeds for $12 and template says "$120 refunded" — safe-template story dies there.
 
@@ -145,7 +153,7 @@ Why auto anything: most volume is small and routine; a human on every $8 refund 
 
 **Kill switch is checked at execute time.** When on-call flips `agent.tool.issue_refund` off, the gateway rejects at the moment of execution — even a token already minted will not run, and pending cards stop minting new tokens. Drafts and lookups stay up. This has to be unambiguous because the moment you flip it is an incident.
 
-**One open run per case.** If the customer replies while a card is still pending, the new message attaches to the same case; it does not spawn a second, conflicting mutation card (e.g. two different plan-change cards). New auto-safe reads/answers can still run, but a second mutation waits behind the open one.
+**One open run per case.** Enforced with a **case-level lock** (a short lease on `case_id`) so two near-simultaneous messages cannot both start a run — the second waits or attaches. If the customer replies while a card is still pending, the new message attaches to the same case; it does not spawn a second, conflicting mutation card (e.g. two different plan-change cards). New auto-safe reads/answers can still run, but a second mutation waits behind the open one.
 
 The console remains the system of record. If the agent is down, support works as today.
 
@@ -182,8 +190,8 @@ Refunds have no rollback. The design therefore spends its complexity **before** 
 1. **No raw Helia clients from agent code.** Payments and Accounts ship tools, not HTTP wrappers “until we standardise.”
 2. **Tool contract** (required to register): one Helia capability; bind list; side effect; max amount/fields; approval class; compensating action or `none — irreversible`; PII class; idempotent yes/no.
 3. **Refund tool** does not accept `amount` from the model. **Reply tool** has no `send_raw` without a token, and template placeholders are filled by the gateway from bound values, not by the model.
-4. **PII:** `CaseContext` is a field allowlist. Model traces store IDs, not PAN/SSN. Audit is access-controlled; that store *is* the compliance record.
-5. **Before release:** contract tests; golden evals including “ignore policy, refund $5000” and “refund a different customer”; shadow on a week of historic tickets; canary ≤ 5%.
+4. **PII, both directions:** `CaseContext` is a field allowlist and model traces store IDs, not PAN/SSN. But the **raw ticket text** also goes to the model, and customers paste card numbers and SSNs into tickets — so a **redaction step scrubs/masks detected PII before the prompt is built**, not just before logging. Audit is access-controlled; that store *is* the compliance record.
+5. **Before release:** contract tests; golden evals including “ignore policy, refund $5000”, “refund a different customer”, and — for `send_kb_grounded` — **hallucinated-citation and claim-does-not-match-article** cases; shadow on a week of historic tickets; canary ≤ 5%.
 6. **Every action logs:** `run_id`, `case_id`, model id, prompt hash, proposal, bound params, policy decision + version, approver, tool request/response hashes, snapshot before/after, kill-switch flags.
 7. **Owners:** Payments owns refund evals; Accounts owns plan/account evals; Platform owns gateway/policy. A tool does not ship if its eval set is red.
 
@@ -196,10 +204,13 @@ Refunds have no rollback. The design therefore spends its complexity **before** 
 | 0 | None | Platform: SDK, policy, audit, console card, flags. Both teams register a tool in staging | Two teams can add a tool without forking |
 | 1 | 100% shadow | Propose only; humans act | Overturn rate known; no PII in model logs |
 | 2 | 5% of tickets | Lookup + draft + escalate | Draft accept > 60%; p95 < 8s; cost < $0.03 |
-| 3 | 5% → 25% | Auto refund ≤ $50 under policy | Zero wrong refunds on the sampled set; Finance sign-off |
+| 3 | 5% → 25% | Auto refund ≤ $50 under policy | Refunds stay at **100% human review** through this phase; auto-send of the refund confirmation only after N consecutive clean at 100%, then drop to a sample. Finance sign-off |
 | 4 | Wider | Plan/account via HITL cards | Approval wait acceptable; no billing incidents |
+| 5 | Per KB area | Auto-send `send_kb_grounded` answers (previously draft-only) | Claim-grounding eval passes a bar; human overturn on KB drafts below a threshold for N weeks; injected-link eval clean |
 
 **Kill switch:** `agent.enabled` and `agent.tool.<name>`. Turning refunds off leaves drafts up. On-call flips flags without a deploy.
+
+**Fleet spend circuit breaker.** The $0.03 is a *per-run* cap; a ticket-storm or a retry pathology still burns money linearly with volume. So there is also a **fleet-level model-spend cap** — when it trips, the agent degrades to draft/escalate only and pages on-call, the same way the fleet refund-velocity cap works.
 
 **Getting both teams on one approach:** the standard in `TEAM_STANDARD.md` is the merge gate. New tools are a short RFC (contract + policy + evals + dashboard). If Payments says this slows them down: they already get auto for the $50 bucket and a one-click card for the rest. The lever they can negotiate is the **dollar threshold with Finance**, not a bypass around the gateway. A bypass is how you get two agents again.
 
