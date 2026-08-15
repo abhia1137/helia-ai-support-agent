@@ -99,7 +99,7 @@ HITL is **async**. The run writes a card on the case and ends the hot path. When
 - Invalid JSON / wrong tool → drop, escalate; do not retry 10 times.
 - Amounts and IDs are bound: auto refund is always the **full last captured charge**. We do not parse money amount from ticket text, even if it is smaller — that text is untrusted, and one exception makes the rule weak. Partial refund always go to human.
 - If customer is pointing to some older charge ("refund my July payment" when August charge also exist), binding to last charge will refund wrong month. So when the asked charge is not clearly the latest one, we escalate and show the candidate charges on the human card.
-- Preconditions on refund: captured charge, no dispute, no prior refund on that charge, account in good standing, velocity cap (per account and fleet). The "no prior refund" check runs **again just before execute**, not only at planning time — a human can refund same charge from the console in parallel, and console today does not pass through our gateway. We also assume Helia refund API rejects second refund on same charge; if it does not, this execute-time recheck is the only guard, so it is mandatory.
+- Preconditions on refund: captured charge, within Finance refund window, no dispute, no prior refund on that charge, account in good standing, velocity cap (per account and fleet). **All** of these are rechecked **just before execute**, not only at planning time — a human can act on the same case from the console in parallel (console today does not pass through our gateway), and a card may be approved hours later, so dispute status, standing, and velocity are all stale by then. The token's 30-minute TTL protects the token, not the world. We also assume Helia rejects a second refund on the same charge; if it does not, this execute-time recheck is the only guard, so it is mandatory.
 - Security / “password” / “take over this account” language → money tools are not even in the allowlist for that run.
 - After a mutation, re-read the account. If state ≠ expected, halt and escalate.
 - Auto-refunds: 100% daily review in week 1, then 10% sample.
@@ -119,19 +119,33 @@ The prompt may say “ask a human.” That is documentation. **Enforcement is th
 | Tool | Agent alone | Rule | Where it is enforced |
 |------|-------------|------|----------------------|
 | `look_up_account` | Yes | Only this ticket’s `customer_id` | Gateway bind |
+| `kb_lookup` | Yes | Read-only. Returns approved help-center articles for grounding an answer | Gateway (read-only) |
 | `escalate_to_human` | Yes | Always allowed | Gateway |
-| `reply_to_customer` | Draft yes | Freeform **send** needs a human. Allowlisted **template** send is allowed only after a successful action in this run | Gateway: `draft` vs `send_template` vs `send_freeform` |
+| `reply_to_customer` | Draft yes | Four send modes (below). `send_freeform` always needs a human | Gateway: `draft` / `send_template` / `send_kb_grounded` / `send_freeform` |
 | `update_account` | No | Always human. Payload is a diff against `CaseContext`, not free text | Gateway + console |
 | `change_plan` | No | Always human (billing impact) | Gateway + console |
-| `issue_refund` | Only if **all** predicates pass: amount ≤ **$50**, amount equals bound charge, charge captured, no prior refund, good standing, under velocity cap | Otherwise human. Approver is `human:<id>` or `policy:refund-v1` | Gateway + token bound to `{case_id, customer_id, charge_id, amount_cents, policy_version}` |
+| `issue_refund` | Only if **all** predicates pass: amount ≤ **$50**, amount equals bound charge, charge captured, within Finance refund window, no prior refund, good standing, under velocity cap | Otherwise human. Approver is `human:<id>` or `policy:refund-v1` | Gateway + signed token (shape below) |
+
+**Four send modes** (this fixes the earlier hole where a KB answer had no legal way to reach the customer):
+
+- `draft` — never reaches customer, human sends.
+- `send_template(id)` — allowlisted template, allowed only after a successful action in this run. Placeholders filled by gateway.
+- `send_kb_grounded` — an answer for a plain question, auto-send allowed **only if every claim is cited to an article that `kb_lookup` actually returned**. Anything not covered by KB → drops to `draft` / escalate. This keeps "no autonomous freeform" true while still letting the biggest volume (questions) auto-resolve.
+- `send_freeform` — free text, always a human.
 
 Why auto anything: most volume is small and routine; a human on every $8 refund will not catch the queue up, and the brief says speed and cost matter. Why not auto plan changes or account edits: they are stateful, often need a conversation, and are reversible only with more billing risk.
 
-**Token:** minted only at the moment the human clicks approve — the card waiting in the console is not a token, so there is no expiry problem when approval comes hours later. After mint it is signed, 30-minute TTL, bound to the exact action. Editing the amount in the console mints a new token. A token for customer A cannot refund customer B.
+**Token:** minted only at the moment the human clicks approve — the card waiting in the console is not a token, so there is no expiry problem when approval comes hours later. After mint it is **signed by the gateway** (the gateway owns the signing key, in KMS; the console only relays the human decision, it never signs). It is single-use, 30-minute TTL, and bound to the exact action. The shape is generic across tools, not refund-only: `{case_id, customer_id, tool, params_hash, policy_version, approver}` — `params_hash` covers the refund charge/amount, or the plan-change diff, or the account-field diff. Editing anything in the console mints a new token. A token for customer A cannot act on customer B, and a refund token cannot be replayed for a plan change.
 
 **Who can approve also matters.** Not every support agent can approve every refund. Above a supervisor limit (say $500 — Finance owns the number) the approval card needs a senior role. Roles come from console permissions which already exist; gateway checks the role inside the token, so a junior click simply does not produce a valid token for big amount.
 
 **Template blanks are not model's job.** Auto-send templates have placeholders like {amount} and {date}. Gateway fills them from **bound values**, never from model text. Otherwise refund succeeds for $12 and template says "$120 refunded" — safe-template story dies there.
+
+**Reject is also a decision.** The card is not only approve. If the human rejects, they pick a reason, that reason is logged with `approver = human:<id>` (a deny is as much a "who decided what" record as an approve), the agent drafts a decline reply or the human replies, and the run closes as `denied`. No token is minted.
+
+**Kill switch is checked at execute time.** When on-call flips `agent.tool.issue_refund` off, the gateway rejects at the moment of execution — even a token already minted will not run, and pending cards stop minting new tokens. Drafts and lookups stay up. This has to be unambiguous because the moment you flip it is an incident.
+
+**One open run per case.** If the customer replies while a card is still pending, the new message attaches to the same case; it does not spawn a second, conflicting mutation card (e.g. two different plan-change cards). New auto-safe reads/answers can still run, but a second mutation waits behind the open one.
 
 The console remains the system of record. If the agent is down, support works as today.
 
@@ -146,16 +160,20 @@ The console remains the system of record. If the agent is down, support works as
 | What failed | What we do | Customer | Support |
 |-------------|------------|----------|---------|
 | Read / lookup | Retry once, then escalate | No false promise. SLA first-response can be a holding line from a template | Error on the case |
-| Mutation fails | Do not retry that key; human may retry from the console (new attempt, same key is safe) | No confirmation | Failed action, safe retry |
+| Mutation clearly fails | Do not retry that key; human may retry from the console. Safe because Helia dedupes on our `idempotency_key` — we assume this; if Helia does not, the execute-time recheck is the only guard | No confirmation | Failed action, safe retry |
+| Mutation times out (outcome unknown) | This is the real double-pay window. Do **not** blind-retry. First **reconcile**: read Helia back (by charge / idempotency key) to see if it went through, then decide. Unknown never means "try again" | No confirmation until reconciled | "Verifying" on the case |
 | Refund OK, reply fails | Do **not** refund again; queue template / human | Briefly unaware of a real refund — better than a lie | “Refund done, reply pending” |
 | Reply then failed action | Forbidden by ordering | — | — |
 | Wrong auto-refund | **Cannot undo.** Finance playbook (ledger flag, possible re-charge — not a second refund), human outreach, consider kill switch | Human-owned message | P1, sampled into overturn review |
 | Wrong plan change | Compensating `change_plan` to the snapshot in the audit log, with HITL if it was a paid change | Human-owned | Previous plan in the snapshot |
-| Process crash mid-run | Resume from last audit event; skip keys already `done` | Unchanged | Run `interrupted` |
+| Process crash mid-run | Resume from last audit event; skip keys already `done`. This only works because the gateway **writes the intent record before calling Helia** (write-ahead) — if it wrote after, a crash in between would re-execute the mutation | Unchanged | Run `interrupted` |
+| Card sits unactioned too long | Cards have an SLA. On breach the case re-queues to a supervisor and the customer gets a holding reply — nobody waits silently | Holding reply | Re-queued to supervisor |
 
 Partial success is a case state, not a reason to spin the loop.
 
 Refunds have no rollback. The design therefore spends its complexity **before** the call (bind, predicates, HITL, velocity), not after.
+
+**Velocity is counted from Helia, not from us.** Because console refunds bypass the gateway (§3), the per-account and fleet velocity caps are computed from **Helia's refund history** (source of truth), not the gateway's own log — otherwise a human console refund would be invisible to the cap. If the fleet cap trips, auto-refunds halt and on-call is paged; humans keep working from the console.
 
 ---
 

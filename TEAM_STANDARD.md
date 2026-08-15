@@ -41,18 +41,19 @@ Changing a row is a **policy version bump**, not a prompt edit. Finance owns the
 
 - **One** Helia capability per tool. No `doWhatever(json)`.
 - Register: side effect, max amount/fields, bind list, approval class, compensating action (or `irreversible`), PII class.
-- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path refunds the full last captured charge only; partial or older charge goes to human.
-- **Reply:** `draft` or `send_template(id)`. No `send_raw` without an approval token. Template placeholders are filled by gateway from bound values, never by model text.
-- **Lookup:** this ticket’s customer only.
+- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path refunds the full last captured charge only, within Finance's refund window; partial or older charge goes to human.
+- **Reply — four send modes only:** `draft` (human sends), `send_template(id)` (after a successful action; gateway fills placeholders), `send_kb_grounded` (question answer, auto-send only if every claim is cited to a returned KB article), `send_freeform` (always human). No `send_raw`.
+- **Lookup:** this ticket’s customer only. **KB lookup:** read-only, approved articles only.
 - **Plan / account:** payload is a diff against `CaseContext`.
+- **Approval token:** minted and signed by the **gateway** only (key in KMS; console just relays the human click). Single-use, 30-min TTL, generic shape `{case_id, customer_id, tool, params_hash, policy_version, approver}`. Kill-switch and all preconditions are re-checked at execute time, so a stale token will not fire.
 
 ---
 
 ### 4. What must be logged (every run)
 
-`run_id`, `case_id`, model id, prompt hash, proposal, bound parameters, policy decision + version, **approver**, tool request/response hashes, account snapshot before/after, outcome, kill-switch flags.
+`run_id`, `case_id`, model id, prompt hash, proposal, bound parameters, policy decision + version, **approver** (and on a reject: `denied` + reason), tool request/response hashes, account snapshot before/after, outcome, kill-switch flags.
 
-This log is the Finance/Legal record of who approved what. Retention per Legal. No PAN/SSN in model traces.
+This log is the Finance/Legal record of who approved **or denied** what. Retention per Legal. No PAN/SSN in model traces.
 
 ---
 
