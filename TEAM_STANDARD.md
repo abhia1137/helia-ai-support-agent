@@ -11,6 +11,7 @@
 - Agent code calls **registered tools**, never Helia APIs.
 - `customer_id`, `charge_id`, amounts, and account fields are **bound from `CaseContext`** (loaded for this ticket). Model output is not the source of those values.
 - Every mutation has an `idempotency_key`. Retrying a mutation without a new key is a bug.
+- Mutation preconditions (like "no refund exists on this charge") are re-checked **at execute time**, not only at planning — a human may act on same case from console in parallel.
 
 ---
 
@@ -27,8 +28,10 @@ Enforced in the **gateway**. A prompt that says “ask a human” is not enough.
 | Send an allowlisted template after a successful action in this run | No |
 | Update account | **Yes** |
 | Change plan | **Yes** |
-| Refund ≤ $50, bound to last captured charge, all policy predicates pass | No — approver = `policy:<version>` |
-| Any other refund | **Yes** — approver = `human:<id>` |
+| Refund ≤ $50, full amount of last captured charge, all policy predicates pass | No — approver = `policy:<version>` |
+| Any other refund (partial amount, older charge, above ceiling) | **Yes** — approver = `human:<id>`, senior role above supervisor limit |
+| Answer a question covered by approved KB articles | No |
+| Answer a question KB does not cover | Escalate — model memory is not a source |
 
 Changing a row is a **policy version bump**, not a prompt edit. Finance owns the dollar figure.
 
@@ -38,8 +41,8 @@ Changing a row is a **policy version bump**, not a prompt edit. Finance owns the
 
 - **One** Helia capability per tool. No `doWhatever(json)`.
 - Register: side effect, max amount/fields, bind list, approval class, compensating action (or `irreversible`), PII class.
-- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model.
-- **Reply:** `draft` or `send_template(id)`. No `send_raw` without an approval token.
+- **Refund:** `charge_id` + bound amount only. No `amount` argument from the model. Auto path refunds the full last captured charge only; partial or older charge goes to human.
+- **Reply:** `draft` or `send_template(id)`. No `send_raw` without an approval token. Template placeholders are filled by gateway from bound values, never by model text.
 - **Lookup:** this ticket’s customer only.
 - **Plan / account:** payload is a diff against `CaseContext`.
 
